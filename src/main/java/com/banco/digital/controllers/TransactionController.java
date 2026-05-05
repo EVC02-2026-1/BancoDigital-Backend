@@ -17,10 +17,26 @@ public class TransactionController {
 
     private final TransactionService transactionService;
     private final UserRepository userRepository;
+    private final com.banco.digital.services.AuthService authService;
+    private final com.banco.digital.services.EmailService emailService;
+    private final com.banco.digital.services.AuditService auditService;
 
-    public TransactionController(TransactionService transactionService, UserRepository userRepository) {
+    public TransactionController(TransactionService transactionService, UserRepository userRepository, com.banco.digital.services.AuthService authService, com.banco.digital.services.EmailService emailService, com.banco.digital.services.AuditService auditService) {
         this.transactionService = transactionService;
         this.userRepository = userRepository;
+        this.authService = authService;
+        this.emailService = emailService;
+        this.auditService = auditService;
+    }
+
+    @PostMapping("/request-otp")
+    public ResponseEntity<?> requestOtp(Authentication authentication) {
+        try {
+            authService.generateMfaCode(authentication.getName(), emailService);
+            return ResponseEntity.ok("Código de seguridad enviado al correo");
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
     }
 
     @PostMapping("/transfer")
@@ -30,7 +46,8 @@ public class TransactionController {
                 request.getFromAccountNumber(),
                 request.getToAccountNumber(),
                 request.getAmount(),
-                request.getDescription()
+                request.getDescription(),
+                request.getMfaCode()
             );
             return ResponseEntity.ok("Transferencia exitosa");
         } catch (Exception e) {
@@ -39,9 +56,12 @@ public class TransactionController {
     }
 
     @GetMapping("/history")
-    public ResponseEntity<List<Transaction>> getHistory(Authentication authentication) {
+    public ResponseEntity<List<com.banco.digital.dto.TransactionDTO>> getHistory(Authentication authentication) {
         User user = userRepository.findByEmail(authentication.getName())
                 .orElseThrow(() -> new RuntimeException("User not found"));
+        
+        auditService.logAction(user.getEmail(), "VIEW_HISTORY", "SUCCESS", "Consulta de historial de transacciones", "system");
+        
         return ResponseEntity.ok(transactionService.getHistory(user.getId()));
     }
 }

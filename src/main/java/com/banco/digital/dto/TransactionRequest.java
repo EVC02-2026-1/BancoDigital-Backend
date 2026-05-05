@@ -9,4 +9,5 @@ public class TransactionRequest {
     private String toAccountNumber;
     private BigDecimal amount;
     private String description;
+    private String mfaCode;
 }

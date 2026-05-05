@@ -21,27 +21,56 @@ public class AuthService {
     private final AccountRepository accountRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtUtils jwtUtils;
+    private final AuditService auditService;
+    private final com.banco.digital.repositories.VerifiedIdentityRepository verifiedIdentityRepository;
 
-    public AuthService(UserRepository userRepository, AccountRepository accountRepository, PasswordEncoder passwordEncoder, JwtUtils jwtUtils) {
+    public AuthService(UserRepository userRepository, AccountRepository accountRepository, PasswordEncoder passwordEncoder, JwtUtils jwtUtils, AuditService auditService, com.banco.digital.repositories.VerifiedIdentityRepository verifiedIdentityRepository) {
         this.userRepository = userRepository;
         this.accountRepository = accountRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtUtils = jwtUtils;
+        this.auditService = auditService;
+        this.verifiedIdentityRepository = verifiedIdentityRepository;
     }
 
     @Transactional
     public AuthResponse register(RegisterRequest request, String dniFront, String dniBack) {
         if (userRepository.existsByEmail(request.getEmail())) {
-            throw new RuntimeException("Email already in use");
+            throw new RuntimeException("El correo ya está registrado");
         }
+
+        if (userRepository.existsByDocumentNumber(request.getDocumentNumber())) {
+            throw new RuntimeException("Este número de documento ya está vinculado a una cuenta");
+        }
+
+        // Validación KYC Local (Fase 5)
+        String docNum = request.getDocumentNumber() != null ? request.getDocumentNumber().trim() : "";
+        System.out.println(">>> Verificando en Registraduría: [" + docNum + "]");
+
+        com.banco.digital.models.VerifiedIdentity identity = verifiedIdentityRepository.findByDocumentNumber(docNum)
+                .orElseThrow(() -> new RuntimeException("Este documento no es válido porque no se encuentra registrado en el sistema de registraduría"));
+        
+        if (identity.isUsed()) {
+            throw new RuntimeException("Documento ya vinculado a otra cuenta");
+        }
+
+        validatePasswordStrength(request.getPassword());
+
+        // Marcar identidad como usada inmediatamente (Fase 10)
+        identity.setUsed(true);
+        verifiedIdentityRepository.save(identity);
 
         User user = User.builder()
                 .name(request.getName())
                 .email(request.getEmail())
                 .password(passwordEncoder.encode(request.getPassword()))
+                .documentNumber(request.getDocumentNumber())
+                .expeditionDate(request.getExpeditionDate())
+                .expeditionPlace(request.getExpeditionPlace())
+                .phoneNumber(request.getPhoneNumber())
                 .dniFront(dniFront)
                 .dniBack(dniBack)
-                .isVerified(false) // Mandatory verification
+                .isVerified(false)
                 .build();
 
         user = userRepository.save(user);
@@ -86,19 +115,57 @@ public class AuthService {
         
         user.setSelfie(selfiePath);
         user.setVerified(true);
+        
+        auditService.logAction(email, "IDENTITY_VERIFIED", "SUCCESS", "KYC completado con éxito", "system");
+        
         return userRepository.save(user);
     }
 
-    public AuthResponse login(AuthRequest request) {
+    public AuthResponse login(AuthRequest request, EmailService emailService) {
         User user = userRepository.findByEmail(request.getEmail())
-                .orElseThrow(() -> new RuntimeException("Invalid credentials"));
+                .orElseThrow(() -> new RuntimeException("Credenciales inválidas"));
 
-        if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
-            throw new RuntimeException("Invalid credentials");
+        if (!user.isAccountNonLocked()) {
+            if (user.getLockTime() != null && user.getLockTime().plusMinutes(15).isBefore(java.time.LocalDateTime.now())) {
+                // Auto-desbloqueo tras 15 minutos
+                user.setAccountNonLocked(true);
+                user.setFailedAttempts(0);
+                user.setLockTime(null);
+                userRepository.save(user);
+            } else {
+                long secondsElapsed = java.time.Duration.between(user.getLockTime(), java.time.LocalDateTime.now()).getSeconds();
+                long remainingSeconds = Math.max(0, 900 - secondsElapsed); // 900s = 15min
+                throw new RuntimeException("ACCOUNT_LOCKED:" + remainingSeconds);
+            }
         }
 
-        String token = jwtUtils.generateToken(user.getEmail());
-        return new AuthResponse(token, user);
+        if (passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+            user.setFailedAttempts(0);
+            userRepository.save(user);
+
+            // Generar y enviar código MFA (OTP)
+            generateMfaCode(user.getEmail(), emailService);
+            
+            auditService.logAction(user.getEmail(), "LOGIN_STEP_1_SUCCESS", "SUCCESS", "Contraseña correcta, se requiere OTP", "system");
+            
+            // Retornamos una señal que el controlador capturará
+            throw new RuntimeException("OTP_REQUIRED");
+        } else {
+            // Incrementar intentos fallidos...
+            int attempts = user.getFailedAttempts() + 1;
+            user.setFailedAttempts(attempts);
+            
+            if (attempts >= 3) {
+                user.setAccountNonLocked(false);
+                user.setLockTime(java.time.LocalDateTime.now());
+                userRepository.save(user);
+                auditService.logAction(request.getEmail(), "ACCOUNT_LOCKED", "SECURITY", "Cuenta bloqueada por intentos fallidos", "system");
+                throw new RuntimeException("ACCOUNT_LOCKED:900");
+            }
+            userRepository.save(user);
+            auditService.logAction(request.getEmail(), "LOGIN_FAILED", "FAILED", "Credenciales incorrectas", "system");
+            throw new RuntimeException("Credenciales inválidas");
+        }
     }
     
     @Transactional
@@ -124,10 +191,83 @@ public class AuthService {
             throw new RuntimeException("El token ha expirado");
         }
         
+        validatePasswordStrength(newPassword);
+        
         user.setPassword(passwordEncoder.encode(newPassword));
         user.setResetToken(null);
         user.setResetTokenExpiry(null);
         
         userRepository.save(user);
+    }
+
+    @Transactional
+    public void generateMfaCode(String email, EmailService emailService) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Usuario no encontrado"));
+                
+        String code = String.format("%06d", (int) (Math.random() * 1000000));
+        user.setMfaCode(code);
+        user.setMfaExpiry(java.time.LocalDateTime.now().plusMinutes(5));
+        
+        userRepository.save(user);
+        
+        emailService.sendMfaEmail(user.getEmail(), code);
+        auditService.logAction(user.getEmail(), "MFA_CODE_SENT", "SUCCESS", "Código MFA enviado al correo", "system");
+    }
+
+    @Transactional
+    public boolean verifyMfaCode(String email, String code) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Usuario no encontrado"));
+                
+        if (user.getMfaCode() == null || !user.getMfaCode().equals(code)) {
+            auditService.logAction(email, "MFA_VERIFY_FAILED", "FAILED", "Código MFA incorrecto", "system");
+            return false;
+        }
+        
+        if (user.getMfaExpiry().isBefore(java.time.LocalDateTime.now())) {
+            auditService.logAction(email, "MFA_VERIFY_FAILED", "FAILED", "Código MFA expirado", "system");
+            return false;
+        }
+        
+        // Limpiar el código tras uso exitoso
+        user.setMfaCode(null);
+        user.setMfaExpiry(null);
+        userRepository.save(user);
+        
+        auditService.logAction(email, "MFA_VERIFY_SUCCESS", "SUCCESS", "MFA verificado correctamente", "system");
+        return true;
+    }
+
+    private void validatePasswordStrength(String password) {
+        if (password == null || password.length() < 8) {
+            throw new RuntimeException("La contraseña debe tener al menos 8 caracteres");
+        }
+        if (!password.matches(".*[A-Z].*")) {
+            throw new RuntimeException("La contraseña debe tener al menos una letra mayúscula");
+        }
+        if (!password.matches(".*[0-9].*")) {
+            throw new RuntimeException("La contraseña debe tener al menos un número");
+        }
+        if (!password.matches(".*[!@#$%^&*(),.?\":{}|<>].*")) {
+            throw new RuntimeException("La contraseña debe tener al menos un carácter especial");
+        }
+    }
+
+    @Transactional
+    public AuthResponse verifyMfaAndGenerateToken(String email, String code) {
+        if (!verifyMfaCode(email, code)) {
+            throw new RuntimeException("Código MFA inválido o expirado");
+        }
+        
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Usuario no encontrado"));
+                
+        String token = jwtUtils.generateToken(user.getEmail());
+        user.setAccounts(new ArrayList<>()); // Evitar ciclos
+        
+        auditService.logAction(email, "LOGIN_SUCCESS", "SUCCESS", "MFA verificado, sesión iniciada", "system");
+        
+        return new AuthResponse(token, user, false);
     }
 }

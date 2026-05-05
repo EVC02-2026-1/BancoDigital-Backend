@@ -19,13 +19,16 @@ public class AccountController {
     private final AccountRepository accountRepository;
     private final UserRepository userRepository;
     private final com.banco.digital.repositories.TransactionRepository transactionRepository;
+    private final com.banco.digital.services.AuditService auditService;
 
     public AccountController(AccountRepository accountRepository, 
                              UserRepository userRepository, 
-                             com.banco.digital.repositories.TransactionRepository transactionRepository) {
+                             com.banco.digital.repositories.TransactionRepository transactionRepository,
+                             com.banco.digital.services.AuditService auditService) {
         this.accountRepository = accountRepository;
         this.userRepository = userRepository;
         this.transactionRepository = transactionRepository;
+        this.auditService = auditService;
     }
 
     @GetMapping("/me")
@@ -56,6 +59,8 @@ public class AccountController {
                 .build();
         transactionRepository.save(transaction);
         
+        auditService.logAction("system", "DEPOSIT", "SUCCESS", "Depósito de " + amount + " en cuenta " + accountNumber, "system");
+        
         return ResponseEntity.ok("Depósito de " + amount + " realizado con éxito en cuenta " + accountNumber);
     }
 
@@ -64,6 +69,12 @@ public class AccountController {
         User user = userRepository.findByEmail(authentication.getName())
                 .orElseThrow(() -> new RuntimeException("User not found"));
         
+        // Regla HU-08: Solo usuarios verificados (KYC)
+        if (!user.isVerified()) {
+            auditService.logAction(user.getEmail(), "CREATE_ACCOUNT_FAILED", "FAILED", "Intento de crear cuenta sin verificación KYC", "system");
+            return ResponseEntity.status(403).body("Debes completar la verificación de identidad (KYC) antes de crear cuentas adicionales.");
+        }
+
         String type = request.getOrDefault("type", "SAVINGS");
         
         // Generar número de cuenta aleatorio de 16 dígitos
@@ -78,6 +89,9 @@ public class AccountController {
                 .user(user)
                 .build();
 
-        return ResponseEntity.ok(accountRepository.save(newAccount));
+        Account saved = accountRepository.save(newAccount);
+        auditService.logAction(user.getEmail(), "CREATE_ACCOUNT_SUCCESS", "SUCCESS", "Nueva cuenta creada: " + accountNumber + " (" + type + ")", "system");
+        
+        return ResponseEntity.ok(saved);
     }
 }

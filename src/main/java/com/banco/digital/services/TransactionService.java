@@ -15,21 +15,32 @@ public class TransactionService {
 
     private final AccountRepository accountRepository;
     private final TransactionRepository transactionRepository;
+    private final AuthService authService;
+    private final AuditService auditService;
 
-    public TransactionService(AccountRepository accountRepository, TransactionRepository transactionRepository) {
+    public TransactionService(AccountRepository accountRepository, TransactionRepository transactionRepository, AuthService authService, AuditService auditService) {
         this.accountRepository = accountRepository;
         this.transactionRepository = transactionRepository;
+        this.authService = authService;
+        this.auditService = auditService;
     }
 
     @Transactional
-    public void transfer(String fromNum, String toNum, java.math.BigDecimal amount, String description) {
+    public void transfer(String fromNum, String toNum, java.math.BigDecimal amount, String description, String mfaCode) {
         Account fromAccount = accountRepository.findByAccountNumber(fromNum)
                 .orElseThrow(() -> new RuntimeException("Cuenta de origen no encontrada"));
         
+        // Validar MFA (HU-09)
+        if (!authService.verifyMfaCode(fromAccount.getUser().getEmail(), mfaCode)) {
+            auditService.logAction(fromAccount.getUser().getEmail(), "TRANSFER_FAILED", "FAILED", "MFA inválido para transferencia", "system");
+            throw new RuntimeException("Código de seguridad inválido o expirado");
+        }
+
         Account toAccount = accountRepository.findByAccountNumber(toNum)
                 .orElseThrow(() -> new RuntimeException("Cuenta de destino no encontrada"));
 
         if (fromAccount.getBalance().compareTo(amount) < 0) {
+            auditService.logAction(fromAccount.getUser().getEmail(), "TRANSFER_FAILED", "FAILED", "Saldo insuficiente: " + amount, "system");
             throw new RuntimeException("Saldo insuficiente");
         }
 
@@ -48,12 +59,47 @@ public class TransactionService {
                 .build();
         
         transactionRepository.save(transaction);
+        
+        auditService.logAction(fromAccount.getUser().getEmail(), "TRANSFER_SUCCESS", "SUCCESS", 
+            String.format("Transferencia de %s a cuenta %s", amount, toNum), "system");
     }
 
-    public List<Transaction> getHistory(Long userId) {
+    public List<com.banco.digital.dto.TransactionDTO> getHistory(Long userId) {
         List<Account> accounts = accountRepository.findByUserId(userId);
         List<Long> ids = accounts.stream().map(Account::getId).collect(Collectors.toList());
         if (ids.isEmpty()) return java.util.Collections.emptyList();
-        return transactionRepository.findByAccountIds(ids);
+        
+        List<Transaction> transactions = transactionRepository.findByAccountIds(ids);
+        
+        return transactions.stream().map(t -> {
+            String fromMasked = "N/A";
+            if (t.getFromAccountId() != null) {
+                fromMasked = accountRepository.findById(t.getFromAccountId())
+                        .map(acc -> maskAccountNumber(acc.getAccountNumber()))
+                        .orElse("Unknown");
+            }
+            
+            String toMasked = "N/A";
+            if (t.getToAccountId() != null) {
+                toMasked = accountRepository.findById(t.getToAccountId())
+                        .map(acc -> maskAccountNumber(acc.getAccountNumber()))
+                        .orElse("Unknown");
+            }
+
+            return com.banco.digital.dto.TransactionDTO.builder()
+                    .id(t.getId())
+                    .fromAccountMasked(fromMasked)
+                    .toAccountMasked(toMasked)
+                    .amount(t.getAmount())
+                    .type(t.getType())
+                    .description(t.getDescription())
+                    .createdAt(t.getCreatedAt())
+                    .build();
+        }).collect(Collectors.toList());
+    }
+
+    private String maskAccountNumber(String accountNumber) {
+        if (accountNumber == null || accountNumber.length() < 4) return "****";
+        return "****" + accountNumber.substring(accountNumber.length() - 4);
     }
 }

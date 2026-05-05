@@ -69,17 +69,23 @@ public class AuthController {
     @PostMapping("/login")
     public ResponseEntity<?> login(@RequestBody AuthRequest request) {
         try {
-            AuthResponse response = authService.login(request);
+            AuthResponse response = authService.login(request, emailService);
             return ResponseEntity.ok(response);
         } catch (Exception e) {
             return ResponseEntity.status(401).body(e.getMessage());
         }
     }
 
-    @GetMapping("/list-users")
-    public ResponseEntity<?> listUsers() {
-        return ResponseEntity.ok(userRepository.findAll());
+    @PostMapping("/verify-otp")
+    public ResponseEntity<?> verifyOtp(@RequestBody com.banco.digital.dto.MfaVerificationRequest request) {
+        try {
+            AuthResponse response = authService.verifyMfaAndGenerateToken(request.getEmail(), request.getCode());
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            return ResponseEntity.status(401).body(e.getMessage());
+        }
     }
+
 
     @PostMapping("/verify-identity")
     public ResponseEntity<?> verifyIdentity(
@@ -94,5 +100,11 @@ public class AuthController {
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
+    }
+
+    @GetMapping("/check-email")
+    public ResponseEntity<?> checkEmail(@RequestParam String email) {
+        boolean exists = userRepository.existsByEmail(email);
+        return ResponseEntity.ok(java.util.Map.of("exists", exists));
     }
 }
